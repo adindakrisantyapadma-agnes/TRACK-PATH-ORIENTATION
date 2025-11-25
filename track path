@@ -1,0 +1,278 @@
+#%%
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+#%%
+print("Program Started")
+
+client = RemoteAPIClient()
+sim = client.require('sim')
+sim.setStepping(False)
+sim.startSimulation()
+
+wR_Handle = sim.getObject("/rightMotor")
+wL_Handle = sim.getObject("/leftMotor")
+s3_Handle = sim.getObject("/ultrasonicSensor[3]")
+p3dx_Handle = sim.getObject("/PioneerP3DX")
+disc_Handle = sim.getObject("/Disc")
+path_Handle = sim.getObject("/Path")
+LH_Handle = sim.getObject("/LH")
+perp_Handle = sim.getObject("/Perp")
+
+def transformMat(alpha, beta, gamma, tx, ty, tz):
+    rotx = np.array([
+        [1, 0, 0],
+        [0, math.cos(alpha), -math.sin(alpha)],
+        [0, math.sin(alpha),  math.cos(alpha)]
+        ])
+    roty = np.array([
+        [ math.cos(beta), 0, math.sin(beta)],
+        [0, 1, 0],
+        [-math.sin(beta), 0, math.cos(beta)]
+        ])
+    rotz = np.array([
+        [math.cos(gamma), -math.sin(gamma), 0],
+        [math.sin(gamma),  math.cos(gamma), 0],
+        [0,0,1]
+        ])
+    rot_total = np.matmul(rotx, roty)
+    rot_total = np.matmul(rot_total, rotz)
+    trans_vector = np.array([[tx],[ty],[tz]])
+    R_t_3x4  = np.hstack((rot_total, trans_vector))
+    homogeneous_row = np.array([[0, 0, 0, 1]])
+    transform_matrix_4x4 = np.vstack((R_t_3x4, homogeneous_row))
+    return transform_matrix_4x4
+    
+
+d_xyyaw = []
+d_t = []
+dat_disc2rob = np.zeros((4, 1))
+dat_errors = np.zeros((3, 1))
+
+t_prv = 0.0
+
+# PARAMETER YANG DIUBAH - MULAI
+# Parameter kecepatan baru
+MAX_LINEAR_SPEED = 0.3  # m/s (dinaikkan dari sebelumnya)
+MAX_ANGULAR_SPEED = 1.5  # rad/s (dinaikkan dari sebelumnya)
+LOOK_AHEAD_DISTANCE = 0.8  # m (dinaikkan untuk smoothing yang lebih baik)
+CONTROL_GAIN_MULTIPLIER = 1.3  # Faktor pengali gain kontrol
+
+# Parameter kontrol yang disesuaikan
+kp_lin_base = 1.5 * CONTROL_GAIN_MULTIPLIER  # Gain linear dasar
+kp_ang_base = 1.0 * CONTROL_GAIN_MULTIPLIER  # Gain angular dasar  
+kp_ori_base = 10.0 * CONTROL_GAIN_MULTIPLIER  # Gain orientasi dasar
+
+# Parameter fisikal robot
+rw = 0.195/2  # wheel radius (m)
+rb = 0.381/2  # half distance between wheels (m)
+d_smoothing = 0.08  # Parameter smoothing untuk transisi mode
+# PARAMETER YANG DIUBAH - SELESAI
+
+sim.addLog(1,"get vel start")
+time.sleep(2)
+start_time = time.time()
+while True:
+    t_now = time.time() - start_time
+    if t_now > 15:
+        break
+
+    pathData = None
+    try:
+        raw = sim.readCustomDataBlock(path_Handle, 'PATH')
+        if raw is not None:
+            pathData = sim.unpackDoubleTable(raw)
+    except Exception as e:
+        sim.addLog(1, f"Could not read path data: {e}")
+
+    if (pathData is None) or (len(pathData) == 0):
+        sim.addLog(1, "Path data not found or empty. Stopping control loop.")
+        break
+
+    np_path = np.array(pathData)
+    try:
+        np_path = np_path.reshape(-1, 7)
+    except Exception as e:
+        sim.addLog(1, f"Path data reshape failed: {e}")
+        break
+
+    # get pose
+    bod_pos_xyz = sim.getObjectPosition(p3dx_Handle)
+    bod_pos_abg = sim.getObjectOrientation(p3dx_Handle)
+
+    # PERHITUNGAN LOOK-AHEAD POINT YANG DIUBAH
+    path_xy = np_path[:, 0:2]
+    dist_to_path = np.linalg.norm(path_xy - np.array([bod_pos_xyz[0], bod_pos_xyz[1]]), axis=1)
+    nearest_idx = int(np.argmin(dist_to_path))
+
+    # Algoritma look-ahead yang lebih smooth
+    look_idx = nearest_idx
+    cum_dist = 0.0
+    path_length = len(path_xy)
+    
+    if path_length > 1:
+        i = nearest_idx
+        # Look further ahead untuk kecepatan yang lebih tinggi
+        adaptive_look_dist = LOOK_AHEAD_DISTANCE * (1 + 0.5 * min(1.0, t_now/5.0))
+        
+        while cum_dist < adaptive_look_dist and i < path_length - 1:
+            i_next = i + 1
+            seg = path_xy[i_next] - path_xy[i]
+            seg_len = np.linalg.norm(seg)
+            cum_dist += seg_len
+            i = i_next
+        look_idx = min(i, path_length - 1)
+
+    look_ahead_pt = path_xy[look_idx]
+    sim.setObjectPosition(LH_Handle, [float(look_ahead_pt[0]), float(look_ahead_pt[1]), 0.14])
+
+    # PERHITUNGAN ERROR YANG DIOPTIMASI
+    np_path_rel = path_xy - look_ahead_pt
+    path_sse = np.linalg.norm(np_path_rel, axis=1)
+    pendic_idx = int(np.argmin(path_sse))
+    if pendic_idx >= len(path_sse):
+        pendic_idx = 0
+
+    disc_pos_xyz = sim.getObjectPosition(disc_Handle)
+    disc_pos_abg = sim.getObjectOrientation(disc_Handle)
+
+    path_pos_xyz_hom = np.array([
+        [np_path[pendic_idx, 0]],
+        [np_path[pendic_idx, 1]],
+        [0.0],
+        [1.0]
+    ])
+
+    sim.setObjectPosition(perp_Handle, [float(np_path[pendic_idx, 0]), float(np_path[pendic_idx, 1]), 0.14])
+
+    path2body_mat = transformMat(0.0, 0.0, bod_pos_abg[2], bod_pos_xyz[0], bod_pos_xyz[1], 0.0)
+    try:
+        path2body_pos = np.matmul(np.linalg.inv(path2body_mat), path_pos_xyz_hom)
+    except np.linalg.LinAlgError:
+        sim.addLog(1, "Singular transform matrix; skipping this iteration.")
+        continue
+
+    ed = path2body_pos[0]
+    eh = np.arctan2(path2body_pos[1], path2body_pos[0])
+    eo = disc_pos_abg[2] - bod_pos_abg[2]
+    abs_d = math.sqrt(float(path2body_pos[0]**2 + path2body_pos[1]**2))
+    errors = np.vstack((ed, eh, eo))
+
+    # KONTROLER YANG DIUBAH - lebih responsif dengan kecepatan lebih tinggi
+    mode = math.exp(-1.0 / d_smoothing * abs_d) if abs_d >= 0 else 0.0
+
+    # Gain adaptif berdasarkan waktu dan kondisi
+    time_factor = min(1.0, t_now/3.0)  # Faktor berdasarkan waktu untuk smooth start
+    
+    kp_lin = kp_lin_base * time_factor
+    kp_ang = kp_ang_base * (1.0 - mode) * time_factor
+    kp_ori = kp_ori_base * mode * time_factor
+
+    kin_mat = np.array([
+        [1.0,  rb],
+        [1.0, -rb]
+    ])
+    
+    vel_vec = np.vstack((ed * kp_lin, eh * kp_ang + eo * kp_ori))
+    
+    # Batasi kecepatan maksimum
+    v_forward = float(vel_vec[0][0])
+    v_angular = float(vel_vec[1][0])
+    
+    v_forward = max(-MAX_LINEAR_SPEED, min(MAX_LINEAR_SPEED, v_forward))
+    v_angular = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, v_angular))
+    
+    vel_vec_limited = np.vstack((v_forward, v_angular))
+
+    v_rl = np.matmul(kin_mat, vel_vec_limited)
+
+    phi_r = float(v_rl[0][0] / rw)
+    phi_l = float(v_rl[1][0] / rw)
+    
+    # Smooth acceleration
+    sim.setJointTargetVelocity(wR_Handle, phi_r)
+    sim.setJointTargetVelocity(wL_Handle, phi_l)
+
+    # -----------------------
+    # save logging data
+    # -----------------------
+    dat_disc2rob = np.hstack((dat_disc2rob, path2body_pos))
+    dat_errors = np.hstack((dat_errors, errors))
+    d_xyyaw.append([bod_pos_xyz[0], bod_pos_xyz[1], bod_pos_abg[2]])
+    d_t.append(t_now)
+
+    t_prv = t_now
+    sim.addLog(1, f"ed, eh, abs_d, t="
+                f"{float(ed[0]):.2f}m, "
+                f"{np.rad2deg(float(eh)): .2f}deg, "
+                f"{mode:.2f}, "
+                f"{t_now:.2f}s")
+
+    
+sim.setJointTargetVelocity(wR_Handle, 0)
+sim.setJointTargetVelocity(wL_Handle, 0)
+sim.addLog(1,"sim com ended")
+
+dat_xyyaw=np.array(d_xyyaw)
+dat_t=np.array(d_t)
+dat_disc2rob = dat_disc2rob[:, 1:]
+dat_errors = dat_errors[:, 1:]
+
+dat_xyyaw[:,2] = np.atan2(np.sin(dat_xyyaw[:,2]), np.cos(dat_xyyaw[:,2]))
+
+# %%
+import os
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# -------------------------
+# Plot XY domain
+# -------------------------
+plt.figure(figsize=(8, 6))
+plt.plot(dat_xyyaw[:,0], dat_xyyaw[:,1], color='royalblue', linewidth=2, label='$^wB$')
+plt.scatter(dat_xyyaw[0,0], dat_xyyaw[0,1], marker='o', s=100, color='red', label='Start')
+plt.scatter(dat_xyyaw[-1,0], dat_xyyaw[-1,1], marker='x', s=100, color='green', label='End')
+plt.xlabel('$x_w$ (m)', fontsize=12)
+plt.ylabel('$y_w$ (m)', fontsize=12)
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+
+now = datetime.now()
+filename = now.strftime("%y%m%d%H%M_xy_track") + ".svg"
+filepath = os.path.join(base_dir, filename)
+plt.savefig(filepath, format='svg')
+print(f"Plot saved successfully as '{filepath}'")
+
+# -------------------------
+# Plot e_d vs time
+# -------------------------
+plt.figure(figsize=(8, 6))
+plt.plot(dat_t, dat_errors[0], color='royalblue', linewidth=2, label='$e_d$')
+plt.xlabel('$t$ (sec)', fontsize=12)
+plt.ylabel('$e_d$ (m)', fontsize=12)
+plt.grid(True, linestyle=':', alpha=0.6)
+plt.legend()
+
+filename = now.strftime("%y%m%d%H%M_ed_track") + ".svg"
+filepath = os.path.join(base_dir, filename)
+plt.savefig(filepath, format='svg')
+print(f"Plot saved successfully as '{filepath}'")
+
+# -------------------------
+# Plot e_h vs time
+# -------------------------
+plt.figure(figsize=(8, 6))
+plt.plot(dat_t, np.rad2deg(dat_errors[1]), color='royalblue', linewidth=2, label='$e_h$')
+plt.xlabel('$t$ (sec)', fontsize=12)
+plt.ylabel('$e_h$ (deg)', fontsize=12)
+plt.grid(True, linestyle=':', alpha=0.6)
+plt.legend()
+
+filename = now.strftime("%y%m%d%H%M_eh_track") + ".svg"
+filepath = os.path.join(base_dir, filename)
+plt.savefig(filepath, format='svg')
+print(f"Plot saved successfully as '{filepath}'")
